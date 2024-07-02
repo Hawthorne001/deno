@@ -1,5 +1,6 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
+use std::collections::BTreeSet;
 use std::collections::HashSet;
 use std::path::Path;
 use std::path::PathBuf;
@@ -15,13 +16,12 @@ use once_cell::sync::Lazy;
 
 use deno_core::error::AnyError;
 
+use crate::package_json::load_pkg_json;
 use crate::path::to_file_specifier;
 use crate::resolution::NodeResolverRc;
 use crate::NodeModuleKind;
-use crate::NodePermissions;
 use crate::NodeResolutionMode;
 use crate::NpmResolverRc;
-use crate::PackageJson;
 use crate::PathClean;
 
 #[derive(Debug, Clone)]
@@ -87,7 +87,6 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
     &self,
     entry_specifier: &ModuleSpecifier,
     source: Option<String>,
-    permissions: &dyn NodePermissions,
   ) -> Result<String, AnyError> {
     let mut temp_var_count = 0;
 
@@ -107,7 +106,8 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
         .to_string(),
     ];
 
-    let mut all_exports = analysis.exports.into_iter().collect::<HashSet<_>>();
+    // use a BTreeSet to make the output deterministic for v8's code cache
+    let mut all_exports = analysis.exports.into_iter().collect::<BTreeSet<_>>();
 
     if !analysis.reexports.is_empty() {
       let mut errors = Vec::new();
@@ -115,7 +115,6 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
         .analyze_reexports(
           entry_specifier,
           analysis.reexports,
-          permissions,
           &mut all_exports,
           &mut errors,
         )
@@ -161,8 +160,7 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
     &'a self,
     entry_specifier: &url::Url,
     reexports: Vec<String>,
-    permissions: &dyn NodePermissions,
-    all_exports: &mut HashSet<String>,
+    all_exports: &mut BTreeSet<String>,
     // this goes through the modules concurrently, so collect
     // the errors in order to be deterministic
     errors: &mut Vec<anyhow::Error>,
@@ -194,7 +192,6 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
             // should be `deno-require`, because `deno` is already used in `esm_resolver.rs`
             &["deno", "require", "default"],
             NodeResolutionMode::Execution,
-            permissions,
           );
           let reexport_specifier = match result {
             Ok(specifier) => specifier,
@@ -287,7 +284,6 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
     referrer: &ModuleSpecifier,
     conditions: &[&str],
     mode: NodeResolutionMode,
-    permissions: &dyn NodePermissions,
   ) -> Result<ModuleSpecifier, AnyError> {
     if specifier.starts_with('/') {
       todo!();
@@ -312,17 +308,11 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
     let module_dir = self.npm_resolver.resolve_package_folder_from_package(
       package_specifier.as_str(),
       referrer,
-      mode,
     )?;
 
     let package_json_path = module_dir.join("package.json");
-    let package_json = PackageJson::load(
-      &*self.fs,
-      &*self.npm_resolver,
-      permissions,
-      package_json_path.clone(),
-    )?;
-    if package_json.exists {
+    let maybe_package_json = load_pkg_json(&*self.fs, &package_json_path)?;
+    if let Some(package_json) = maybe_package_json {
       if let Some(exports) = &package_json.exports {
         return self.node_resolver.package_exports_resolve(
           &package_json_path,
@@ -332,7 +322,6 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
           NodeModuleKind::Esm,
           conditions,
           mode,
-          permissions,
         );
       }
 
@@ -342,13 +331,9 @@ impl<TCjsCodeAnalyzer: CjsCodeAnalyzer> NodeCodeTranslator<TCjsCodeAnalyzer> {
         if self.fs.is_dir_sync(&d) {
           // subdir might have a package.json that specifies the entrypoint
           let package_json_path = d.join("package.json");
-          let package_json = PackageJson::load(
-            &*self.fs,
-            &*self.npm_resolver,
-            permissions,
-            package_json_path,
-          )?;
-          if package_json.exists {
+          let maybe_package_json =
+            load_pkg_json(&*self.fs, &package_json_path)?;
+          if let Some(package_json) = maybe_package_json {
             if let Some(main) = package_json.main(NodeModuleKind::Cjs) {
               return Ok(to_file_specifier(&d.join(main).clean()));
             }
